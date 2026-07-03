@@ -3,8 +3,10 @@
 
 Pinch your cheek (thumb + index finger together) on camera and pull:
 the skin stretches like rubber and follows your fingers, ending exactly
-where your hand stops. Release the pinch and it snaps back with an
-elastic wobble -- just like Luffy.
+where your hand stops. Pinch near your OTHER hand instead and you pull a
+thin elastic strand from your finger. Release any grab and it snaps
+straight back, overshoots past where it started, and swings to rest --
+proper elastic behavior, just like Luffy.
 
 Run:
     python luffy_effect.py
@@ -260,25 +262,29 @@ def render_flap(dst, src, anchor, pull, scale):
 
 
 class SnapBack:
-    """Damped spring that wobbles a released grab back to its anchor."""
+    """Damped spring that snaps a released grab back to its anchor: it flies
+    straight back, overshoots PAST the anchor, and swings a couple of times
+    before settling -- proper elastic behavior."""
 
-    DECAY = 8.0        # 1/s exponential decay
-    FREQ_HZ = 3.2      # wobble frequency
-    DONE_BELOW = 0.02  # amplitude at which the wobble is considered finished
+    DECAY = 5.0         # 1/s exponential decay (lower = bouncier)
+    FREQ_HZ = 3.0       # wobble frequency
+    DONE_BELOW = 0.015  # amplitude at which the wobble is considered finished
 
-    def __init__(self, anchor, release_point):
+    def __init__(self, anchor, release_point, scale):
         self.anchor = anchor
         self.v0 = (release_point[0] - anchor[0], release_point[1] - anchor[1])
+        self.scale = scale
         self.t0 = time.time()
 
     def pull(self):
-        """Current (anchor, pull) pair for this wobble, or None once settled."""
+        """Current (anchor, pull, scale) for this wobble, or None once done."""
         t = time.time() - self.t0
         s = math.exp(-t * self.DECAY) * math.cos(2 * math.pi * self.FREQ_HZ * t)
         if abs(s) < self.DONE_BELOW:
             return None
         px, py = self.anchor
-        return ((px, py), (px + self.v0[0] * s, py + self.v0[1] * s))
+        return ((px, py), (px + self.v0[0] * s, py + self.v0[1] * s),
+                self.scale)
 
 
 # ----------------------------------------------------------------------------
@@ -289,6 +295,12 @@ PINCH_ENGAGE = 0.32   # pinch when tip distance / hand size drops below this
 PINCH_RELEASE = 0.50  # release when it rises above this (hysteresis)
 ENGAGE_FRAMES = 2     # pinch must hold this many frames before grabbing
 DEAD_ZONE = 0.06      # no warp until the hand moves this many face-widths
+HAND_SNAP = 0.35      # snap-to-finger distance, in face widths
+# Flap size per grab target, as a multiple of the face width: a cheek grab
+# makes a thick skin flap, a grab on the other hand pulls a thin strand.
+SCALE_FACE = 1.0
+SCALE_HAND = 0.28
+SCALE_FREE = 0.55
 THUMB_TIP, INDEX_TIP = 4, 8
 WRIST, MIDDLE_MCP = 0, 9
 # Face mesh side points used to estimate face width in pixels.
@@ -427,34 +439,58 @@ class HandGrab:
         self.active = False
         self.ready = False      # hand must be seen OPEN before it can grab
         self.pinch_frames = 0
-        self.face_idx = None    # face landmark the grab is glued to
-        self.offset = (0.0, 0.0)  # pinch point relative to that landmark
-        self.fixed_anchor = None  # anchor for grabs that start off the face
+        self.mode = ("free",)   # ("face", idx) | ("hand", label, idx) | ("free",)
+        self.offset = (0.0, 0.0)  # pinch point relative to the tracked landmark
+        self.fixed_anchor = None  # anchor for grabs on nothing in particular
+        self.last_anchor = None   # fallback if the tracked target vanishes
+        self.scale_mult = SCALE_FREE  # flap size for this grab, x face width
         self.q = None           # smoothed pull point (fingertips)
 
-    def anchor(self, face_pts):
-        if self.face_idx is not None and face_pts is not None:
-            lx, ly = face_pts[self.face_idx]
-            return (float(lx) + self.offset[0], float(ly) + self.offset[1])
-        return self.fixed_anchor
+    def anchor(self, face_pts, hands_by_label):
+        """Current anchor position, tracking whatever was grabbed."""
+        base = None
+        if self.mode[0] == "face" and face_pts is not None:
+            base = face_pts[self.mode[1]]
+        elif self.mode[0] == "hand" and self.mode[1] in hands_by_label:
+            base = hands_by_label[self.mode[1]][self.mode[2]]
+        elif self.fixed_anchor is not None:
+            self.last_anchor = self.fixed_anchor
+            return self.fixed_anchor
+        if base is None:
+            return self.last_anchor
+        self.last_anchor = (float(base[0]) + self.offset[0],
+                            float(base[1]) + self.offset[1])
+        return self.last_anchor
 
-    def engage(self, pinch_pt, face_pts, snap_dist):
+    def engage(self, pinch_pt, face_pts, other_hands, face_w):
         """Start a grab with ZERO displacement: the anchor is exactly the
-        pinch point, so nothing moves until the hand actually pulls. Near
-        the face the anchor is stored relative to the nearest face landmark
-        so it stays glued to the cheek while the head moves."""
+        pinch point, so nothing moves until the hand actually pulls. The
+        anchor glues itself to the nearest landmark of the face (thick
+        cheek flap) or of the OTHER hand (thin finger strand), and tracks
+        it as the target moves."""
         self.active = True
         self.q = pinch_pt
-        self.face_idx = None
+        self.mode = ("free",)
         self.fixed_anchor = pinch_pt
+        self.last_anchor = pinch_pt
+        self.scale_mult = SCALE_FREE
+
+        best = None  # (distance, mode, landmark point, scale multiplier)
         if face_pts is not None:
             d = np.linalg.norm(face_pts - np.float32(pinch_pt), axis=1)
-            idx = int(np.argmin(d))
-            if d[idx] <= snap_dist:
-                self.face_idx = idx
-                self.offset = (pinch_pt[0] - float(face_pts[idx][0]),
-                               pinch_pt[1] - float(face_pts[idx][1]))
-                self.fixed_anchor = None
+            i = int(np.argmin(d))
+            if d[i] <= 0.65 * face_w:
+                best = (d[i], ("face", i), face_pts[i], SCALE_FACE)
+        for label, pts in other_hands.items():
+            d = np.linalg.norm(pts - np.float32(pinch_pt), axis=1)
+            i = int(np.argmin(d))
+            if d[i] <= HAND_SNAP * face_w and (best is None or d[i] < best[0]):
+                best = (d[i], ("hand", label, i), pts[i], SCALE_HAND)
+        if best is not None:
+            _, self.mode, base_pt, self.scale_mult = best
+            self.offset = (pinch_pt[0] - float(base_pt[0]),
+                           pinch_pt[1] - float(base_pt[1]))
+            self.fixed_anchor = None
 
     def update(self, pinch_pt, smoothing=0.55):
         qx = self.q[0] * (1 - smoothing) + pinch_pt[0] * smoothing
@@ -463,7 +499,7 @@ class HandGrab:
 
     def release(self):
         self.active = False
-        self.face_idx = None
+        self.mode = ("free",)
         self.fixed_anchor = None
         self.q = None
 
@@ -539,24 +575,28 @@ def run_live(args):
             face_pts = face_pts * np.float32([w, h])
             face_w = float(np.linalg.norm(face_pts[FACE_LEFT] - face_pts[FACE_RIGHT]))
 
-        snap_dist = 0.65 * face_w
         max_stretch = args.max_stretch * face_w
         dead_zone = DEAD_ZONE * face_w
 
-        pulls = []   # (anchor, fingertip) pairs to render this frame
+        pulls = []   # (anchor, fingertip, flap scale) to render this frame
         hand_pts_list = []
         seen_labels = set()
+        hands_px = []   # (label, 21x2 pixel landmarks) for every hand
 
         for pts, label in tracked_hands:
             pts = pts * np.float32([w, h])
+            while label in seen_labels:  # two hands can share a handedness
+                label += "'"
+            seen_labels.add(label)
+            hands_px.append((label, pts))
+            hand_pts_list.append(pts)
+        hands_by_label = dict(hands_px)
+
+        for label, pts in hands_px:
             info = hand_pinch_info(pts)
             if info is None:
                 continue
             pinch_pt, pinch_ratio = info
-            hand_pts_list.append(pts)
-            while label in seen_labels:  # two hands can share a handedness
-                label += "'"
-            seen_labels.add(label)
             grab = grabs_by_hand.setdefault(label, HandGrab())
 
             if not grab.active:
@@ -569,33 +609,38 @@ def run_live(args):
                 elif grab.ready and pinch_ratio < PINCH_ENGAGE:
                     grab.pinch_frames += 1
                     if grab.pinch_frames >= ENGAGE_FRAMES:
-                        grab.engage(pinch_pt, face_pts, snap_dist)
+                        others = {l: p for l, p in hands_px if l != label}
+                        grab.engage(pinch_pt, face_pts, others, face_w)
                         grab.ready = False
                         grab.pinch_frames = 0
             elif pinch_ratio > PINCH_RELEASE:
-                anchor = grab.anchor(face_pts)
+                anchor = grab.anchor(face_pts, hands_by_label)
                 if anchor is not None and grab.q is not None:
                     q_eff = effective_pull(anchor, grab.q, dead_zone)
                     if q_eff is not None:
-                        snapbacks.append(SnapBack(anchor, q_eff))
+                        snapbacks.append(SnapBack(anchor, q_eff,
+                                                  grab.scale_mult * face_w))
                 grab.release()
-            else:
+            elif pinch_ratio < PINCH_ENGAGE + 0.10:
                 grab.update(pinch_pt)
+            # between thresholds: fingers are opening -- hold the pull point
+            # steady so the release springs from where the pinch last was
 
         # A hand that disappears from tracking mid-grab also snaps back.
         for label, grab in grabs_by_hand.items():
             if grab.active and label not in seen_labels:
-                anchor = grab.anchor(face_pts)
+                anchor = grab.anchor(face_pts, hands_by_label)
                 if anchor is not None and grab.q is not None:
                     q_eff = effective_pull(anchor, grab.q, dead_zone)
                     if q_eff is not None:
-                        snapbacks.append(SnapBack(anchor, q_eff))
+                        snapbacks.append(SnapBack(anchor, q_eff,
+                                                  grab.scale_mult * face_w))
                 grab.release()
 
         for grab in grabs_by_hand.values():
             if not grab.active:
                 continue
-            anchor = grab.anchor(face_pts)
+            anchor = grab.anchor(face_pts, hands_by_label)
             if anchor is None or grab.q is None:
                 continue
             q_eff = effective_pull(anchor, grab.q, dead_zone)
@@ -608,7 +653,7 @@ def run_live(args):
             if stretch > max_stretch:  # rubber has limits, even Luffy's
                 k = max_stretch / stretch
                 qx, qy = px + vx * k, py + vy * k
-            pulls.append(((px, py), (qx, qy)))
+            pulls.append(((px, py), (qx, qy), grab.scale_mult * face_w))
 
         alive = []
         for sb in snapbacks:
@@ -618,19 +663,19 @@ def run_live(args):
                 pulls.append(pq)
         snapbacks = alive
 
-        # A gentle, local tug on the cheek at the grab point; the stretch
-        # itself is the flap overlay, so nothing else on the face moves.
+        # A gentle, local tug on the skin at the grab point; the stretch
+        # itself is the flap overlay, so nothing else in the frame moves.
         base_grabs = []
-        for p, q in pulls:
-            g = root_grab(p, q, face_w)
+        for p, q, sc in pulls:
+            g = root_grab(p, q, sc)
             if g is not None:
                 base_grabs.append(g)
 
         out = apply_warp(frame, base_grabs)
         if out is frame and pulls:
             out = frame.copy()
-        for p, q in pulls:
-            out = render_flap(out, frame, p, q, face_w)
+        for p, q, sc in pulls:
+            out = render_flap(out, frame, p, q, sc)
 
         # Draw the real hands back on top so the fingers appear to hold the
         # stretched skin instead of being covered by it.
@@ -644,7 +689,7 @@ def run_live(args):
             if face_pts is not None:
                 for x, y in face_pts[::4]:
                     cv2.circle(out, (int(x), int(y)), 1, (0, 255, 0), -1)
-            for (px, py), (qx, qy) in pulls:
+            for (px, py), (qx, qy), _sc in pulls:
                 cv2.circle(out, (int(px), int(py)), 5, (0, 0, 255), -1)
                 cv2.circle(out, (int(qx), int(qy)), 5, (255, 0, 0), -1)
                 cv2.line(out, (int(px), int(py)), (int(qx), int(qy)),
@@ -695,10 +740,10 @@ def _draw_test_face(w=480, h=480):
 def selftest(out_path):
     img = _draw_test_face()
     h, w = img.shape[:2]
-    anchor = (w // 2 - 95, h // 2 + 45)  # left cheek / mouth corner
+    anchor = (w // 2 - 65, h // 2 + 55)  # on the left cheek, inside the face
 
     # The grabbed pixel must land exactly at the pull point.
-    pull = (60, h // 2 + 60)
+    pull = (35, h // 2 + 90)
     map_x, map_y = build_maps(h, w, [make_grab(anchor, pull, 120)], scale=1.0)
     sx, sy = map_x[pull[1], pull[0]], map_y[pull[1], pull[0]]
     assert abs(sx - anchor[0]) < 1.0 and abs(sy - anchor[1]) < 1.0, \
@@ -709,8 +754,13 @@ def selftest(out_path):
     assert abs(map_x[far[1], far[0]] - far[0]) < 1e-3
     assert abs(map_y[far[1], far[0]] - far[1]) < 1e-3
 
-    # Snap-back spring decays to rest.
-    sb = SnapBack(anchor, pull)
+    # Snap-back spring overshoots past the anchor, then decays to rest.
+    sb = SnapBack(anchor, pull, 200.0)
+    sb.t0 -= 0.5 / SnapBack.FREQ_HZ  # half a period in: mid-overshoot
+    _, over_q, _ = sb.pull()
+    to_pull = (pull[0] - anchor[0]) * (over_q[0] - anchor[0]) + \
+              (pull[1] - anchor[1]) * (over_q[1] - anchor[1])
+    assert to_pull < 0, "snap-back should overshoot past the anchor"
     sb.t0 -= 5.0  # pretend 5 seconds passed
     assert sb.pull() is None, "snap-back should settle"
 
@@ -743,11 +793,17 @@ def selftest(out_path):
         out = apply_warp(img, [g])
         return render_flap(out, img, anchor, (qx, qy), scale)
 
-    mid = ((anchor[0] + pull[0]) // 2, (anchor[1] + pull[1]) // 2)
-    over = (anchor[0] + int((anchor[0] - pull[0]) * 0.25),
-            anchor[1] + int((anchor[1] - pull[1]) * 0.25))
-    panels = [img, stretched(*mid), stretched(*pull), stretched(*over)]
-    labels = ["idle", "pulling", "hand stops here", "snap-back wobble"]
+    mid = ((anchor[0] + 2 * pull[0]) // 3, (anchor[1] + 2 * pull[1]) // 3)
+    over = (anchor[0] + int((anchor[0] - pull[0]) * 0.45),
+            anchor[1] + int((anchor[1] - pull[1]) * 0.45))
+
+    # A thin finger strand: same renderer at hand scale, pulled from the
+    # right cheek up past the face edge.
+    strand = render_flap(img.copy(), img, (w // 2 + 85, h // 2 + 15),
+                         (w - 40, 85), SCALE_HAND * scale)
+
+    panels = [img, stretched(*mid), stretched(*pull), stretched(*over), strand]
+    labels = ["idle", "pulling", "hand stops here", "overshoot!", "finger strand"]
     for panel, label in zip(panels, labels):
         cv2.putText(panel, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                     (30, 30, 30), 2)

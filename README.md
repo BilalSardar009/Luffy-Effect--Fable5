@@ -32,7 +32,11 @@ that it works offline.
 3. Keep them pinched and pull away — your cheek stretches with your hand
    and stays wherever your hand stops. Nothing warps until you actually
    pull; just pinching leaves your face alone.
-4. Open your fingers to release — the cheek snaps back and wobbles.
+4. Open your fingers to release — the skin snaps **straight back,
+   overshoots past where it started, and swings to rest**, like a rubber
+   band.
+5. Pinch near your **other hand** instead and you pull a **thin elastic
+   strand** off your finger — same elastic snap on release.
 
 Works with **both hands at once** (stretch both cheeks!), and you can also
 grab and stretch anything else in the frame, not just your face.
