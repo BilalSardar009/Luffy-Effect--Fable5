@@ -46,6 +46,11 @@ FLAP_TIP_CAP = 0.86     # where the rounded tip cap begins (fraction of length)
 FLAP_FEATHER = 0.25     # feathered edge, as a fraction of the half-width
 FLAP_SPEC = 0.10        # specular highlight strength on stretched skin
 FLAP_BRIGHT = 0.08      # brightening of fully stretched skin
+FLAP_SAG = 0.10         # gravity droop of the flap (fraction of its length)
+FLAP_SHADE = 0.10       # top-lit shading: brighter upper edge, darker lower
+# How hard the face itself is dragged toward the hand (the widened grin).
+ROOT_PULL = 0.40        # fraction of the stretch
+ROOT_PULL_MAX = 0.55    # cap, in face widths
 
 
 def make_grab(anchor, pull, base_radius):
@@ -131,6 +136,41 @@ def apply_warp(frame, grabs):
                      borderMode=cv2.BORDER_REFLECT)
 
 
+def _flap_dims(stretch, scale, ny):
+    """Shared flap geometry: (root_back, half_root, half_tip, sag).
+
+    The sag is capped below the tip half-width so the drooped flap can
+    never uncover the face-drag warp that runs underneath it."""
+    root_back = FLAP_ROOT_BACK * scale
+    half_root = max(12.0, FLAP_ROOT_HALF * scale)
+    half_tip = half_root * max(FLAP_TIP_MIN, 1.0 - 0.30 * stretch / scale)
+    sag = min(FLAP_SAG * stretch, 0.9 * half_tip) * ny
+    return root_back, half_root, half_tip, sag
+
+
+def root_grab(anchor, pull, scale):
+    """Grab tuple that drags the face itself toward the hand -- this is what
+    widens the grin and bares the teeth. The drag is aimed along the flap's
+    drooped centerline so the warped cheek and the flap overlay line up.
+    Returns None when the pull is too small to matter."""
+    vx, vy = pull[0] - anchor[0], pull[1] - anchor[1]
+    stretch = math.hypot(vx, vy)
+    if stretch < 2.0:
+        return None
+    ux, uy = vx / stretch, vy / stretch
+    nx, ny = -uy, ux
+    k_len = min(ROOT_PULL * stretch, ROOT_PULL_MAX * scale)
+    root_back, _, _, sag = _flap_dims(stretch, scale, ny)
+    t_root = (root_back + k_len) / (root_back + stretch)
+    bow = sag * 4.0 * t_root * (1.0 - t_root)
+    target = (anchor[0] + ux * k_len + nx * bow,
+              anchor[1] + uy * k_len + ny * bow)
+    g = make_grab(anchor, target, 0.6 * scale)
+    # The flap overlay covers everything past the drag target, so the warp
+    # needs almost no forward reach of its own.
+    return g[:5] + (max(16.0, 0.10 * scale),) + g[6:]
+
+
 def render_flap(dst, src, anchor, pull, scale):
     """Draw a stretched-skin flap from `anchor` to `pull` on top of `dst`.
 
@@ -151,14 +191,15 @@ def render_flap(dst, src, anchor, pull, scale):
     ux, uy = vx / stretch, vy / stretch
     nx, ny = -uy, ux
 
-    root_back = FLAP_ROOT_BACK * scale     # strip starts inside the cheek
+    # Heavy skin droops: the strip's centerline bows downward, zero at both
+    # ends (root and fingers) and largest mid-flap.
+    root_back, half_root, half_tip, sag = _flap_dims(stretch, scale, ny)
     ax, ay = px - ux * root_back, py - uy * root_back
     length = root_back + stretch           # strip reaches exactly the pinch
     src_len = root_back + min(stretch, FLAP_SRC_LEN * scale)
-    half_root = max(12.0, FLAP_ROOT_HALF * scale)
-    half_tip = half_root * max(FLAP_TIP_MIN, 1.0 - 0.30 * stretch / scale)
+    gravity_n = ny                    # how vertical the strip's normal is
 
-    span = half_root + 1.0
+    span = half_root + abs(sag) + 1.0
     x0 = max(0, int(min(ax, qx) - span) - 4)
     x1 = min(w, int(max(ax, qx) + span) + 5)
     y0 = max(0, int(min(ay, qy) - span) - 4)
@@ -170,7 +211,9 @@ def render_flap(dst, src, anchor, pull, scale):
                        np.arange(y0, y1, dtype=np.float32))
     t = ((X - ax) * ux + (Y - ay) * uy) / length   # 0 at root, 1 at pinch
     sdist = (X - ax) * nx + (Y - ay) * ny          # signed lateral distance
-    wt = half_root + (half_tip - half_root) * np.clip(t, 0.0, 1.0)
+    tc = np.clip(t, 0.0, 1.0)
+    sdist = sdist - sag * 4.0 * tc * (1.0 - tc)    # follow the drooped line
+    wt = half_root + (half_tip - half_root) * tc
     s = sdist / np.maximum(wt, 1e-3)               # -1..1 across the flap
 
     # Rounded tip: past FLAP_TIP_CAP the allowed width shrinks like a circle.
@@ -197,7 +240,11 @@ def render_flap(dst, src, anchor, pull, scale):
     spec = (FLAP_SPEC * stretch_f
             * np.clip(1.0 - s_eff * s_eff, 0.0, 1.0) ** 2
             * np.clip(4.0 * t * (1.0 - t), 0.0, 1.0))
-    gain = 1.0 + FLAP_BRIGHT * stretch_f + spec - 0.15 * stretch_f * edge
+    # Top-lit cylinder shading: the edge facing up catches light, the one
+    # facing down falls into shadow -- sells the roundness of the flap.
+    shade = FLAP_SHADE * stretch_f * gravity_n * -np.clip(s, -1.0, 1.0)
+    gain = (1.0 + FLAP_BRIGHT * stretch_f + spec + shade
+            - 0.15 * stretch_f * edge)
     flap = np.clip(flap.astype(np.float32) * gain[..., None], 0, 255)
 
     ramp = np.clip(t / 0.12, 0.0, 1.0)     # blend out of the cheek at root
@@ -567,17 +614,14 @@ def run_live(args):
                 pulls.append(pq)
         snapbacks = alive
 
-        # A subtle residual warp tugs the cheek toward the pull so the flap
-        # looks attached; the flap itself is rendered as a clean overlay.
+        # Drag the face itself toward the hand (this is what widens the grin
+        # and bares the teeth in the real video); the flap continues from
+        # the dragged cheek as a clean overlay.
         base_grabs = []
         for p, q in pulls:
-            vx, vy = q[0] - p[0], q[1] - p[1]
-            stretch = math.hypot(vx, vy)
-            if stretch < 2.0:
-                continue
-            k = min(0.22 * stretch, 0.30 * face_w) / stretch
-            base_grabs.append(make_grab(p, (p[0] + vx * k, p[1] + vy * k),
-                                        0.5 * face_w))
+            g = root_grab(p, q, face_w)
+            if g is not None:
+                base_grabs.append(g)
 
         out = apply_warp(frame, base_grabs)
         if out is frame and pulls:
@@ -683,21 +727,17 @@ def selftest(out_path):
     ux, uy = ux / seg, uy / seg
     along = (xs - anchor[0]) * ux + (ys - anchor[1]) * uy
     perp = np.abs((ys - anchor[1]) * ux - (xs - anchor[0]) * uy)
-    margin = FLAP_ROOT_HALF * scale + 6
+    margin = FLAP_ROOT_HALF * scale + FLAP_SAG * seg + 6
     assert along.min() > -FLAP_ROOT_BACK * scale - 6 and along.max() < seg + 6, \
         "flap leaked along the pull axis"
     assert perp.max() < margin, "flap leaked sideways"
 
     # Render a montage: idle, mid pull, full pull, overshoot wobble.
     def stretched(qx, qy):
-        vx, vy = qx - anchor[0], qy - anchor[1]
-        stretch = math.hypot(vx, vy)
-        if stretch < 2.0:
+        g = root_grab(anchor, (qx, qy), scale)
+        if g is None:
             return img.copy()
-        k = min(0.22 * stretch, 0.30 * scale) / stretch
-        out = apply_warp(img, [make_grab(anchor,
-                                         (anchor[0] + vx * k, anchor[1] + vy * k),
-                                         0.5 * scale)])
+        out = apply_warp(img, [g])
         return render_flap(out, img, anchor, (qx, qy), scale)
 
     mid = ((anchor[0] + pull[0]) // 2, (anchor[1] + pull[1]) // 2)
