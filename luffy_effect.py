@@ -37,6 +37,16 @@ PLATEAU = 0.40
 # Flap half-width at the fingertip, as a fraction of the root half-width.
 TIP_WIDTH = 0.35
 
+# --- skin-flap overlay (all lengths are fractions of the face width) -------
+FLAP_ROOT_BACK = 0.18   # flap begins this far behind the grab anchor
+FLAP_SRC_LEN = 0.35     # how much real skin is fed into the stretch
+FLAP_ROOT_HALF = 0.20   # half-width of the flap at its root
+FLAP_TIP_MIN = 0.55     # tip half-width as a fraction of the root (minimum)
+FLAP_TIP_CAP = 0.86     # where the rounded tip cap begins (fraction of length)
+FLAP_FEATHER = 0.25     # feathered edge, as a fraction of the half-width
+FLAP_SPEC = 0.10        # specular highlight strength on stretched skin
+FLAP_BRIGHT = 0.08      # brightening of fully stretched skin
+
 
 def make_grab(anchor, pull, base_radius):
     """Build one grab tuple: pull the pixel at `anchor` to `pull`.
@@ -121,6 +131,83 @@ def apply_warp(frame, grabs):
                      borderMode=cv2.BORDER_REFLECT)
 
 
+def render_flap(dst, src, anchor, pull, scale):
+    """Draw a stretched-skin flap from `anchor` to `pull` on top of `dst`.
+
+    This is what makes the effect clean: instead of liquify-warping the
+    whole frame, the flap is an explicit textured strip -- real skin
+    sampled around the anchor, stretched uniformly along its length, with
+    feathered edges, a rounded tip, and a specular sheen. The background
+    is never dragged, so there is no smearing. `src` supplies the clean
+    skin texture (the unwarped camera frame); `scale` is the face width.
+    """
+    h, w = src.shape[:2]
+    px, py = float(anchor[0]), float(anchor[1])
+    qx, qy = float(pull[0]), float(pull[1])
+    vx, vy = qx - px, qy - py
+    stretch = math.hypot(vx, vy)
+    if stretch < 2.0:
+        return dst
+    ux, uy = vx / stretch, vy / stretch
+    nx, ny = -uy, ux
+
+    root_back = FLAP_ROOT_BACK * scale     # strip starts inside the cheek
+    ax, ay = px - ux * root_back, py - uy * root_back
+    length = root_back + stretch           # strip reaches exactly the pinch
+    src_len = root_back + min(stretch, FLAP_SRC_LEN * scale)
+    half_root = max(12.0, FLAP_ROOT_HALF * scale)
+    half_tip = half_root * max(FLAP_TIP_MIN, 1.0 - 0.30 * stretch / scale)
+
+    span = half_root + 1.0
+    x0 = max(0, int(min(ax, qx) - span) - 4)
+    x1 = min(w, int(max(ax, qx) + span) + 5)
+    y0 = max(0, int(min(ay, qy) - span) - 4)
+    y1 = min(h, int(max(ay, qy) + span) + 5)
+    if x1 <= x0 or y1 <= y0:
+        return dst
+
+    X, Y = np.meshgrid(np.arange(x0, x1, dtype=np.float32),
+                       np.arange(y0, y1, dtype=np.float32))
+    t = ((X - ax) * ux + (Y - ay) * uy) / length   # 0 at root, 1 at pinch
+    sdist = (X - ax) * nx + (Y - ay) * ny          # signed lateral distance
+    wt = half_root + (half_tip - half_root) * np.clip(t, 0.0, 1.0)
+    s = sdist / np.maximum(wt, 1e-3)               # -1..1 across the flap
+
+    # Rounded tip: past FLAP_TIP_CAP the allowed width shrinks like a circle.
+    f = np.clip((t - FLAP_TIP_CAP) / (1.0 - FLAP_TIP_CAP), 0.0, 1.0)
+    s_eff = np.abs(s) / np.maximum(np.sqrt(1.0 - f * f), 1e-4)
+
+    inside = (t >= 0.0) & (t <= 1.0) & (s_eff <= 1.0)
+    if not inside.any():
+        return dst
+
+    # Sample the real skin: linear along the strip (uniform stretch, no
+    # smear); laterally always from the full root width, so the texture
+    # pinches together toward the fingertips like held skin.
+    map_x = ax + ux * (t * src_len) + nx * (s * half_root)
+    map_y = ay + uy * (t * src_len) + ny * (s * half_root)
+    flap = cv2.remap(src, map_x, map_y, cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REFLECT)
+
+    # Shading: stretched rubber skin lightens and catches a specular streak
+    # down its center; the feathered edges roll away and darken slightly.
+    stretch_f = min(1.0, max(0.0, (length - src_len) / max(src_len, 1.0)))
+    edge = np.clip((s_eff - (1.0 - FLAP_FEATHER)) / FLAP_FEATHER, 0.0, 1.0)
+    edge = edge * edge * (3.0 - 2.0 * edge)
+    spec = (FLAP_SPEC * stretch_f
+            * np.clip(1.0 - s_eff * s_eff, 0.0, 1.0) ** 2
+            * np.clip(4.0 * t * (1.0 - t), 0.0, 1.0))
+    gain = 1.0 + FLAP_BRIGHT * stretch_f + spec - 0.15 * stretch_f * edge
+    flap = np.clip(flap.astype(np.float32) * gain[..., None], 0, 255)
+
+    ramp = np.clip(t / 0.12, 0.0, 1.0)     # blend out of the cheek at root
+    alpha = np.where(inside, ramp * (1.0 - edge), 0.0).astype(np.float32)
+    alpha = alpha[..., None]
+    region = dst[y0:y1, x0:x1].astype(np.float32)
+    dst[y0:y1, x0:x1] = (flap * alpha + region * (1.0 - alpha)).astype(np.uint8)
+    return dst
+
+
 class SnapBack:
     """Damped spring that wobbles a released grab back to its anchor."""
 
@@ -128,22 +215,19 @@ class SnapBack:
     FREQ_HZ = 3.2      # wobble frequency
     DONE_BELOW = 0.02  # amplitude at which the wobble is considered finished
 
-    def __init__(self, anchor, release_point, base_radius):
+    def __init__(self, anchor, release_point):
         self.anchor = anchor
         self.v0 = (release_point[0] - anchor[0], release_point[1] - anchor[1])
-        self.base_radius = base_radius
         self.t0 = time.time()
 
-    def grab(self):
-        """Current grab tuple for this wobble, or None once it has settled."""
+    def pull(self):
+        """Current (anchor, pull) pair for this wobble, or None once settled."""
         t = time.time() - self.t0
         s = math.exp(-t * self.DECAY) * math.cos(2 * math.pi * self.FREQ_HZ * t)
         if abs(s) < self.DONE_BELOW:
             return None
         px, py = self.anchor
-        return make_grab((px, py),
-                         (px + self.v0[0] * s, py + self.v0[1] * s),
-                         self.base_radius)
+        return ((px, py), (px + self.v0[0] * s, py + self.v0[1] * s))
 
 
 # ----------------------------------------------------------------------------
@@ -404,12 +488,11 @@ def run_live(args):
             face_pts = face_pts * np.float32([w, h])
             face_w = float(np.linalg.norm(face_pts[FACE_LEFT] - face_pts[FACE_RIGHT]))
 
-        base_radius = max(40.0, 0.55 * face_w)
         snap_dist = 0.65 * face_w
         max_stretch = args.max_stretch * face_w
         dead_zone = DEAD_ZONE * face_w
 
-        grabs = []
+        pulls = []   # (anchor, fingertip) pairs to render this frame
         hand_pts_list = []
         seen_labels = set()
 
@@ -443,7 +526,7 @@ def run_live(args):
                 if anchor is not None and grab.q is not None:
                     q_eff = effective_pull(anchor, grab.q, dead_zone)
                     if q_eff is not None:
-                        snapbacks.append(SnapBack(anchor, q_eff, base_radius))
+                        snapbacks.append(SnapBack(anchor, q_eff))
                 grab.release()
             else:
                 grab.update(pinch_pt)
@@ -455,7 +538,7 @@ def run_live(args):
                 if anchor is not None and grab.q is not None:
                     q_eff = effective_pull(anchor, grab.q, dead_zone)
                     if q_eff is not None:
-                        snapbacks.append(SnapBack(anchor, q_eff, base_radius))
+                        snapbacks.append(SnapBack(anchor, q_eff))
                 grab.release()
 
         for grab in grabs_by_hand.values():
@@ -474,19 +557,37 @@ def run_live(args):
             if stretch > max_stretch:  # rubber has limits, even Luffy's
                 k = max_stretch / stretch
                 qx, qy = px + vx * k, py + vy * k
-            grabs.append(make_grab((px, py), (qx, qy), base_radius))
+            pulls.append(((px, py), (qx, qy)))
 
-        snapbacks = [s for s in snapbacks if s.grab() is not None]
-        for s in snapbacks:
-            g = s.grab()
-            if g is not None:
-                grabs.append(g)
+        alive = []
+        for sb in snapbacks:
+            pq = sb.pull()
+            if pq is not None:
+                alive.append(sb)
+                pulls.append(pq)
+        snapbacks = alive
 
-        out = apply_warp(frame, grabs)
+        # A subtle residual warp tugs the cheek toward the pull so the flap
+        # looks attached; the flap itself is rendered as a clean overlay.
+        base_grabs = []
+        for p, q in pulls:
+            vx, vy = q[0] - p[0], q[1] - p[1]
+            stretch = math.hypot(vx, vy)
+            if stretch < 2.0:
+                continue
+            k = min(0.22 * stretch, 0.30 * face_w) / stretch
+            base_grabs.append(make_grab(p, (p[0] + vx * k, p[1] + vy * k),
+                                        0.5 * face_w))
+
+        out = apply_warp(frame, base_grabs)
+        if out is frame and pulls:
+            out = frame.copy()
+        for p, q in pulls:
+            out = render_flap(out, frame, p, q, face_w)
 
         # Draw the real hands back on top so the fingers appear to hold the
-        # stretched skin instead of being smeared by the warp.
-        if grabs and hand_overlay and hand_pts_list:
+        # stretched skin instead of being covered by it.
+        if pulls and hand_overlay and hand_pts_list:
             alpha = hand_overlay_mask(hand_pts_list, h, w)
             if alpha is not None:
                 out = (frame.astype(np.float32) * alpha
@@ -496,15 +597,11 @@ def run_live(args):
             if face_pts is not None:
                 for x, y in face_pts[::4]:
                     cv2.circle(out, (int(x), int(y)), 1, (0, 255, 0), -1)
-            for px, py, qx, qy, r_behind, r_ahead, r_perp in grabs:
+            for (px, py), (qx, qy) in pulls:
                 cv2.circle(out, (int(px), int(py)), 5, (0, 0, 255), -1)
                 cv2.circle(out, (int(qx), int(qy)), 5, (255, 0, 0), -1)
                 cv2.line(out, (int(px), int(py)), (int(qx), int(qy)),
                          (0, 255, 255), 2)
-                angle = math.degrees(math.atan2(qy - py, qx - px))
-                cv2.ellipse(out, ((int(qx), int(qy)),
-                                  (int(2 * r_behind), int(2 * r_perp)), angle),
-                            (255, 255, 0), 1)
 
         now = time.time()
         fps = 0.9 * fps + 0.1 * (1.0 / max(now - t_prev, 1e-6))
@@ -566,13 +663,42 @@ def selftest(out_path):
     assert abs(map_y[far[1], far[0]] - far[1]) < 1e-3
 
     # Snap-back spring decays to rest.
-    sb = SnapBack(anchor, pull, 120)
+    sb = SnapBack(anchor, pull)
     sb.t0 -= 5.0  # pretend 5 seconds passed
-    assert sb.grab() is None, "snap-back should settle"
+    assert sb.pull() is None, "snap-back should settle"
+
+    scale = 200.0  # test face is ~300 px wide; scale plays the face width
+
+    # A tiny stretch must leave the frame untouched (no push on pinch).
+    tiny = render_flap(img.copy(), img, anchor, (anchor[0] + 1, anchor[1]), scale)
+    assert np.array_equal(tiny, img), "flap must be invisible before pulling"
+
+    # The flap must stay inside its own corridor between anchor and pull.
+    flapped = render_flap(img.copy(), img, anchor, pull, scale)
+    diff = np.abs(flapped.astype(np.int16) - img.astype(np.int16)).max(axis=2)
+    ys, xs = np.nonzero(diff > 8)
+    assert xs.size, "flap should be visible at full stretch"
+    ux, uy = np.float32(pull) - np.float32(anchor)
+    seg = math.hypot(ux, uy)
+    ux, uy = ux / seg, uy / seg
+    along = (xs - anchor[0]) * ux + (ys - anchor[1]) * uy
+    perp = np.abs((ys - anchor[1]) * ux - (xs - anchor[0]) * uy)
+    margin = FLAP_ROOT_HALF * scale + 6
+    assert along.min() > -FLAP_ROOT_BACK * scale - 6 and along.max() < seg + 6, \
+        "flap leaked along the pull axis"
+    assert perp.max() < margin, "flap leaked sideways"
 
     # Render a montage: idle, mid pull, full pull, overshoot wobble.
     def stretched(qx, qy):
-        return apply_warp(img, [make_grab(anchor, (qx, qy), 120)])
+        vx, vy = qx - anchor[0], qy - anchor[1]
+        stretch = math.hypot(vx, vy)
+        if stretch < 2.0:
+            return img.copy()
+        k = min(0.22 * stretch, 0.30 * scale) / stretch
+        out = apply_warp(img, [make_grab(anchor,
+                                         (anchor[0] + vx * k, anchor[1] + vy * k),
+                                         0.5 * scale)])
+        return render_flap(out, img, anchor, (qx, qy), scale)
 
     mid = ((anchor[0] + pull[0]) // 2, (anchor[1] + pull[1]) // 2)
     over = (anchor[0] + int((anchor[0] - pull[0]) * 0.25),

@@ -69,14 +69,14 @@ grab and stretch anything else in the frame, not just your face.
   zone. Near the face the anchor is stored relative to the nearest face
   landmark, so the grab stays glued to your cheek even while your head
   moves. A pinch away from the face grabs that spot in the frame instead.
-- **The stretch**: an inverse warp (`cv2.remap`) pulls the anchored pixel to
-  the fingertips. The influence region is a cone-shaped flap — narrow at
-  the fingers, widening back to the grabbed skin. Along the pull the
-  falloff is a linear ramp, so the skin texture stretches uniformly (clean,
-  not smeared); across it a rigid plateau core moves as one piece with only
-  a thin shear band at the edges, and reach past the fingertips is minimal
-  so the background in front of your hand stays put. Displacement maps are
-  computed on a downscaled grid and upsampled, keeping it real-time on CPU.
+- **The stretch** is rendered in two layers, like the original viral video:
+  - A **skin flap overlay**: a strip of *real* skin sampled around the grab
+    point, stretched uniformly along the pull, drawn on top of the frame
+    with feathered edges, a rounded tip, a specular sheen, and slight
+    brightening — a clean rubber flap, with zero background smearing
+    because the frame under it is never liquified.
+  - A **subtle root warp** (`cv2.remap` with a small cone-shaped falloff)
+    that tugs the cheek toward the pull so the flap looks attached.
 - **Snap-back**: on release, a damped spring animates the stretch back to
   zero with an overshoot wobble — the rubber-band feel.
 - **Hand on top**: after warping, the real (unwarped) hand pixels are
