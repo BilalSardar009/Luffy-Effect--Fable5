@@ -48,9 +48,12 @@ FLAP_SPEC = 0.10        # specular highlight strength on stretched skin
 FLAP_BRIGHT = 0.08      # brightening of fully stretched skin
 FLAP_SAG = 0.10         # gravity droop of the flap (fraction of its length)
 FLAP_SHADE = 0.10       # top-lit shading: brighter upper edge, darker lower
-# How hard the face itself is dragged toward the hand (the widened grin).
-ROOT_PULL = 0.40        # fraction of the stretch
-ROOT_PULL_MAX = 0.55    # cap, in face widths
+# A small tug on the cheek right at the grab point, so the flap looks
+# attached. Kept subtle and local: the mouth, teeth and background must
+# not deform -- only the cheek stretches.
+ROOT_PULL = 0.15        # fraction of the stretch
+ROOT_PULL_MAX = 0.20    # cap, in face widths
+ROOT_RADIUS = 0.35      # influence radius of the tug, in face widths
 
 
 def make_grab(anchor, pull, base_radius):
@@ -149,9 +152,10 @@ def _flap_dims(stretch, scale, ny):
 
 
 def root_grab(anchor, pull, scale):
-    """Grab tuple that drags the face itself toward the hand -- this is what
-    widens the grin and bares the teeth. The drag is aimed along the flap's
-    drooped centerline so the warped cheek and the flap overlay line up.
+    """Grab tuple for a small, local tug on the cheek at the grab point, so
+    the flap looks attached to the skin instead of pasted on. It is aimed
+    along the flap's drooped centerline so the two layers line up, and kept
+    tight enough that the mouth and the background never move.
     Returns None when the pull is too small to matter."""
     vx, vy = pull[0] - anchor[0], pull[1] - anchor[1]
     stretch = math.hypot(vx, vy)
@@ -165,7 +169,7 @@ def root_grab(anchor, pull, scale):
     bow = sag * 4.0 * t_root * (1.0 - t_root)
     target = (anchor[0] + ux * k_len + nx * bow,
               anchor[1] + uy * k_len + ny * bow)
-    g = make_grab(anchor, target, 0.6 * scale)
+    g = make_grab(anchor, target, ROOT_RADIUS * scale)
     # The flap overlay covers everything past the drag target, so the warp
     # needs almost no forward reach of its own.
     return g[:5] + (max(16.0, 0.10 * scale),) + g[6:]
@@ -614,9 +618,8 @@ def run_live(args):
                 pulls.append(pq)
         snapbacks = alive
 
-        # Drag the face itself toward the hand (this is what widens the grin
-        # and bares the teeth in the real video); the flap continues from
-        # the dragged cheek as a clean overlay.
+        # A gentle, local tug on the cheek at the grab point; the stretch
+        # itself is the flap overlay, so nothing else on the face moves.
         base_grabs = []
         for p, q in pulls:
             g = root_grab(p, q, face_w)
