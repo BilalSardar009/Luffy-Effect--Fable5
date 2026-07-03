@@ -31,20 +31,24 @@ import numpy as np
 
 # Displacement maps are computed on a downscaled grid and resized back up,
 # which keeps the per-frame warp cheap enough for real time.
-MAP_SCALE = 0.25
+MAP_SCALE = 0.35
+# Fraction of the flap half-width that moves rigidly (no shear smear inside).
+PLATEAU = 0.40
+# Flap half-width at the fingertip, as a fraction of the root half-width.
+TIP_WIDTH = 0.35
 
 
 def make_grab(anchor, pull, base_radius):
     """Build one grab tuple: pull the pixel at `anchor` to `pull`.
 
-    The influence region is an ellipse around the pull point, elongated
-    along the pull direction, so a long stretch forms a narrow rubber flap
-    (like a pinched cheek) instead of smearing a huge circle of the frame.
+    The influence region is a cone-shaped flap: narrow at the fingertips,
+    widening back to the skin it was grabbed from, with almost no reach
+    past the fingertips so the rest of the frame stays put.
     """
     stretch = math.hypot(pull[0] - anchor[0], pull[1] - anchor[1])
-    r_behind = max(30.0, base_radius * 0.8 + 0.75 * stretch)  # toward anchor
-    r_ahead = max(30.0, base_radius * 0.8)   # past the fingertip: stay short
-    r_perp = max(30.0, base_radius * 0.8 + 0.15 * stretch)
+    r_behind = stretch + 0.55 * base_radius  # flap root, just behind anchor
+    r_ahead = max(24.0, 0.35 * base_radius)  # past the fingertip: stay short
+    r_perp = max(24.0, 0.42 * base_radius + 0.08 * stretch)
     return (anchor[0], anchor[1], pull[0], pull[1], r_behind, r_ahead, r_perp)
 
 
@@ -78,11 +82,25 @@ def build_maps(h, w, grabs, scale=MAP_SCALE):
         dy = grid_y - qy
         along = dx * ux + dy * uy      # distance along the pull direction
         perp = dy * ux - dx * uy       # distance across it
-        # (x/r)^2 has zero slope at x=0, so switching radii there is seamless.
-        r_along = np.where(along > 0, np.float32(r_ahead), np.float32(r_behind))
-        k = 1.0 - (along / r_along) ** 2 - (perp / r_perp) ** 2
-        np.clip(k, 0.0, None, out=k)
-        k *= k  # smooth falloff, exactly 1 at the pull point, 0 outside
+
+        # Along the pull: a LINEAR ramp behind the fingertip. Its derivative
+        # is constant, so the skin texture stretches uniformly from root to
+        # tip -- a clean rubber stretch instead of a smeared blur. Because
+        # r_behind = stretch + margin, the ramp never folds the image over.
+        back = np.clip(1.0 + along / r_behind, 0.0, 1.0)
+        ahead = np.clip(1.0 - (along / r_ahead) ** 2, 0.0, None)
+        ahead *= ahead                 # quick smooth falloff past the tip
+        k_along = np.where(along <= 0, back, ahead).astype(np.float32)
+
+        # Across the pull: a cone, narrow at the fingertip and widening back
+        # to the grabbed skin, with a rigid plateau core so the middle of the
+        # flap moves as one piece and only a thin border band shears.
+        width = np.where(along <= 0,
+                         TIP_WIDTH + (1.0 - TIP_WIDTH) * (-along / r_behind),
+                         np.float32(TIP_WIDTH)).astype(np.float32)
+        tp = np.abs(perp) / (r_perp * width)
+        s = np.clip((tp - PLATEAU) / (1.0 - PLATEAU), 0.0, 1.0)
+        k = k_along * (1.0 - s * s * (3.0 - 2.0 * s))
         delta_x -= k * vx
         delta_y -= k * vy
 
@@ -132,8 +150,10 @@ class SnapBack:
 # Face/hand tracking (MediaPipe imported lazily so --selftest works without it)
 # ----------------------------------------------------------------------------
 
-PINCH_ENGAGE = 0.40   # pinch when tip distance / hand size drops below this
-PINCH_RELEASE = 0.55  # release when it rises above this (hysteresis)
+PINCH_ENGAGE = 0.32   # pinch when tip distance / hand size drops below this
+PINCH_RELEASE = 0.50  # release when it rises above this (hysteresis)
+ENGAGE_FRAMES = 2     # pinch must hold this many frames before grabbing
+DEAD_ZONE = 0.06      # no warp until the hand moves this many face-widths
 THUMB_TIP, INDEX_TIP = 4, 8
 WRIST, MIDDLE_MCP = 0, 9
 # Face mesh side points used to estimate face width in pixels.
@@ -270,16 +290,24 @@ class HandGrab:
 
     def __init__(self):
         self.active = False
-        self.face_idx = None    # face landmark being held, if snapped to face
+        self.ready = False      # hand must be seen OPEN before it can grab
+        self.pinch_frames = 0
+        self.face_idx = None    # face landmark the grab is glued to
+        self.offset = (0.0, 0.0)  # pinch point relative to that landmark
         self.fixed_anchor = None  # anchor for grabs that start off the face
         self.q = None           # smoothed pull point (fingertips)
 
     def anchor(self, face_pts):
         if self.face_idx is not None and face_pts is not None:
-            return tuple(face_pts[self.face_idx])
+            lx, ly = face_pts[self.face_idx]
+            return (float(lx) + self.offset[0], float(ly) + self.offset[1])
         return self.fixed_anchor
 
     def engage(self, pinch_pt, face_pts, snap_dist):
+        """Start a grab with ZERO displacement: the anchor is exactly the
+        pinch point, so nothing moves until the hand actually pulls. Near
+        the face the anchor is stored relative to the nearest face landmark
+        so it stays glued to the cheek while the head moves."""
         self.active = True
         self.q = pinch_pt
         self.face_idx = None
@@ -289,6 +317,8 @@ class HandGrab:
             idx = int(np.argmin(d))
             if d[idx] <= snap_dist:
                 self.face_idx = idx
+                self.offset = (pinch_pt[0] - float(face_pts[idx][0]),
+                               pinch_pt[1] - float(face_pts[idx][1]))
                 self.fixed_anchor = None
 
     def update(self, pinch_pt, smoothing=0.55):
@@ -301,6 +331,17 @@ class HandGrab:
         self.face_idx = None
         self.fixed_anchor = None
         self.q = None
+
+
+def effective_pull(anchor, q, dead_zone):
+    """Pull point with the dead zone subtracted, or None if the hand hasn't
+    moved far enough from the anchor for the warp to kick in."""
+    vx, vy = q[0] - anchor[0], q[1] - anchor[1]
+    stretch = math.hypot(vx, vy)
+    if stretch <= dead_zone + 1.0:
+        return None
+    k = (stretch - dead_zone) / stretch
+    return (anchor[0] + vx * k, anchor[1] + vy * k)
 
 
 def hand_pinch_info(pts):
@@ -366,6 +407,7 @@ def run_live(args):
         base_radius = max(40.0, 0.55 * face_w)
         snap_dist = 0.65 * face_w
         max_stretch = args.max_stretch * face_w
+        dead_zone = DEAD_ZONE * face_w
 
         grabs = []
         hand_pts_list = []
@@ -383,14 +425,27 @@ def run_live(args):
             seen_labels.add(label)
             grab = grabs_by_hand.setdefault(label, HandGrab())
 
-            if not grab.active and pinch_ratio < PINCH_ENGAGE:
-                grab.engage(pinch_pt, face_pts, snap_dist)
-            elif grab.active and pinch_ratio > PINCH_RELEASE:
+            if not grab.active:
+                # Require an open hand first, then a held pinch: this stops
+                # accidental grabs while the hand is still approaching the
+                # face (which used to shove pixels around before the grab).
+                if pinch_ratio > PINCH_RELEASE:
+                    grab.ready = True
+                    grab.pinch_frames = 0
+                elif grab.ready and pinch_ratio < PINCH_ENGAGE:
+                    grab.pinch_frames += 1
+                    if grab.pinch_frames >= ENGAGE_FRAMES:
+                        grab.engage(pinch_pt, face_pts, snap_dist)
+                        grab.ready = False
+                        grab.pinch_frames = 0
+            elif pinch_ratio > PINCH_RELEASE:
                 anchor = grab.anchor(face_pts)
                 if anchor is not None and grab.q is not None:
-                    snapbacks.append(SnapBack(anchor, grab.q, base_radius))
+                    q_eff = effective_pull(anchor, grab.q, dead_zone)
+                    if q_eff is not None:
+                        snapbacks.append(SnapBack(anchor, q_eff, base_radius))
                 grab.release()
-            elif grab.active:
+            else:
                 grab.update(pinch_pt)
 
         # A hand that disappears from tracking mid-grab also snaps back.
@@ -398,7 +453,9 @@ def run_live(args):
             if grab.active and label not in seen_labels:
                 anchor = grab.anchor(face_pts)
                 if anchor is not None and grab.q is not None:
-                    snapbacks.append(SnapBack(anchor, grab.q, base_radius))
+                    q_eff = effective_pull(anchor, grab.q, dead_zone)
+                    if q_eff is not None:
+                        snapbacks.append(SnapBack(anchor, q_eff, base_radius))
                 grab.release()
 
         for grab in grabs_by_hand.values():
@@ -407,12 +464,13 @@ def run_live(args):
             anchor = grab.anchor(face_pts)
             if anchor is None or grab.q is None:
                 continue
+            q_eff = effective_pull(anchor, grab.q, dead_zone)
+            if q_eff is None:
+                continue
             px, py = anchor
-            qx, qy = grab.q
+            qx, qy = q_eff
             vx, vy = qx - px, qy - py
             stretch = math.hypot(vx, vy)
-            if stretch < 2.0:
-                continue
             if stretch > max_stretch:  # rubber has limits, even Luffy's
                 k = max_stretch / stretch
                 qx, qy = px + vx * k, py + vy * k

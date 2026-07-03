@@ -26,9 +26,12 @@ that it works offline.
 ## How to use it
 
 1. Face the camera so your face is detected.
-2. Bring your thumb and index finger together (a pinch) on your cheek.
+2. Bring your **open** hand to your cheek, then pinch thumb + index
+   together right on the spot you want to grab. (The open-hand-first rule
+   is what stops accidental grabs while your hand is moving.)
 3. Keep them pinched and pull away — your cheek stretches with your hand
-   and stays wherever your hand stops.
+   and stays wherever your hand stops. Nothing warps until you actually
+   pull; just pinching leaves your face alone.
 4. Open your fingers to release — the cheek snaps back and wobbles.
 
 Works with **both hands at once** (stretch both cheeks!), and you can also
@@ -58,17 +61,22 @@ grab and stretch anything else in the frame, not just your face.
 - **Face**: MediaPipe FaceLandmarker gives 478 face landmarks per frame.
 - **Hands**: MediaPipe HandLandmarker gives 21 landmarks for up to 2 hands.
 - **Pinch detection**: thumb-tip to index-tip distance, normalized by hand
-  size, with hysteresis so the grab doesn't flicker on/off.
-- **Grabbing**: when a pinch starts near the face, the grab anchors to the
-  nearest face landmark and *tracks it*, so the effect stays glued to your
-  cheek even while your head moves. A pinch away from the face grabs that
-  spot in the frame instead.
+  size, with hysteresis, a hold-to-engage debounce, and an
+  open-hand-before-grab rule so a hand approaching the face never grabs by
+  accident.
+- **Grabbing**: the grab starts with *zero* displacement exactly at the
+  pinch point, and only stretches once the hand moves past a small dead
+  zone. Near the face the anchor is stored relative to the nearest face
+  landmark, so the grab stays glued to your cheek even while your head
+  moves. A pinch away from the face grabs that spot in the frame instead.
 - **The stretch**: an inverse warp (`cv2.remap`) pulls the anchored pixel to
-  the fingertips. The influence region is an ellipse elongated along the
-  pull direction — long behind the fingertips (the rubber flap), short ahead
-  of them (so the background in front of your hand doesn't smear) and narrow
-  across. Displacement maps are computed on a downscaled grid and upsampled,
-  keeping it real-time on CPU.
+  the fingertips. The influence region is a cone-shaped flap — narrow at
+  the fingers, widening back to the grabbed skin. Along the pull the
+  falloff is a linear ramp, so the skin texture stretches uniformly (clean,
+  not smeared); across it a rigid plateau core moves as one piece with only
+  a thin shear band at the edges, and reach past the fingertips is minimal
+  so the background in front of your hand stays put. Displacement maps are
+  computed on a downscaled grid and upsampled, keeping it real-time on CPU.
 - **Snap-back**: on release, a damped spring animates the stretch back to
   zero with an overshoot wobble — the rubber-band feel.
 - **Hand on top**: after warping, the real (unwarped) hand pixels are
